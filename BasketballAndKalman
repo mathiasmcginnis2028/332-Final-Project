@@ -1,0 +1,255 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+
+def AIDetect(frame,confidence): #given a frame, detects possible basketball locations
+    results = model.predict(
+            source=frame,
+            conf=confidence,
+            classes=[0]
+        )
+    return results
+def BestAI(results): #given a list of possible basketball locations, find the best one
+    for result in results:
+         if len(result.boxes) > 0:
+            best_box = max(result.boxes, key=lambda box: box.conf.item())
+    
+            x1, y1, x2, y2 = best_box.xyxy[0].tolist()
+            return [x1,y1,x2,y2]
+         else:
+                return None
+def HoughTrans(ball_window, frame):
+
+    # Calculate crop boundaries
+    x1 = max(0, int(ball_window[0]) - 10)
+    y1 = max(0, int(ball_window[1]) - 10)
+    x2 = min(int(ball_window[2]) + 10, max_x)
+    y2 = min(int(ball_window[3]) + 10, max_y)
+
+    # Make sure the crop is valid
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    basketball_crop = frame[y1:y2, x1:x2]
+
+    # Additional check
+    if basketball_crop.size == 0:
+        return None
+
+    gray = cv2.cvtColor(basketball_crop, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (9, 9), 2)
+
+    basketball_loco = cv2.HoughCircles(
+        gray,
+        cv2.HOUGH_GRADIENT,
+        dp=1,
+        param1=75,
+        param2=25,
+        minDist=20,
+        minRadius=5,
+        maxRadius=1000
+    )
+
+    if basketball_loco is not None:
+        basketball_loco = np.round(basketball_loco[0]).astype(int)
+
+        x, y, r = basketball_loco[0]
+
+        # Convert crop coordinates to frame coordinates
+        x += x1
+        y += y1
+
+        return [x, y, r]
+
+    return None
+
+def GetCrop(frame, pred_x, pred_y, win_size):
+    crop_x1 = max(0, pred_x - win_size)
+    crop_y1 = max(0, pred_y - win_size)
+
+    crop_x2 = min(pred_x + win_size, max_x)
+    crop_y2 = min(pred_y + win_size, max_y)
+
+    if crop_x2 <= crop_x1 or crop_y2 <= crop_y1:
+        return None, None, None, None, None
+
+    crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+
+    if crop.size == 0:
+        return None, None, None, None, None
+
+    return crop, crop_x1, crop_y1, crop_x2, crop_y2
+
+
+
+
+#load model
+model = YOLO("runs/detect/train-6/weights/best.pt")
+#load video
+vid_name = input("Enter video name: ")
+video = cv2.VideoCapture(vid_name)
+fps = video.get(cv2.CAP_PROP_FPS)
+frames = []
+while True:
+    ret, frame = video.read()
+    if not ret:
+        break
+    frames.append(frame)
+
+max_x = frames[0].shape[1]
+max_y = frames[0].shape[0]
+drawn_frames = []
+prev_rad = None
+delta_t = 1/fps
+
+kf = cv2.KalmanFilter(4,2)
+velocity_dampening = 0.9
+kf.transitionMatrix = np.array([
+    [1,0,delta_t,0],
+    [0,1,0,delta_t],
+    [0,0,velocity_dampening,0],
+    [0,0,0,velocity_dampening]
+], np.float32)
+
+kf.measurementMatrix = np.array([
+    [1, 0, 0, 0],
+    [0, 1, 0, 0]
+], np.float32)
+
+kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 1 #value is sigma squared. increase for less trust in measurements
+kf.processNoiseCov = np.array([
+    [delta_t**4/4, 0, delta_t**3/2, 0],
+    [0, delta_t**4/4, 0, delta_t**3/2],
+    [delta_t**3/2, 0, delta_t**2, 0],
+    [0, delta_t**3/2, 0, delta_t**2]
+], dtype=np.float32) * 7500 #increase for less trust in model
+
+kf.errorCovPost = np.diag([
+    25,
+    25,
+    1000,
+    1000
+]).astype(np.float32)
+
+
+
+first_detection = BestAI(AIDetect(frames[0],0.5))
+
+if first_detection is not None:
+    initial_x = (first_detection[0] + first_detection[2]) / 2
+    initial_y = (first_detection[1] + first_detection[3]) / 2
+
+    kf.statePost = np.array([
+        [initial_x],
+        [initial_y],
+        [0],
+        [0]
+    ], dtype=np.float32)
+
+win_size = 100
+clamp = 1
+for frame in frames:
+    prediction = kf.predict()
+    pred_x = int(prediction[0, 0])
+    pred_y = int(prediction[1, 0])
+    crop, crop_x1, crop_y1, crop_x2, crop_y2 = GetCrop(
+    frame, pred_x, pred_y, win_size
+    )
+
+    if crop is not None:
+        results = AIDetect(crop, 0.2)
+        ball_window = BestAI(results)
+    else:
+        ball_window = None
+
+    if ball_window is not None:
+        ball_window[0] += crop_x1
+        ball_window[2] += crop_x1
+        ball_window[1] += crop_y1
+        ball_window[3] += crop_y1
+    else:
+        for i in range(1,6):
+            crop_x1 = max(0, pred_x - win_size-(10*i))
+            crop_y1 = max(0, pred_y - win_size-(10*i))
+            crop_x2 = min(pred_x + win_size+(10*i), max_x)
+            crop_y2 = min(pred_y + win_size+(10*i), max_y)
+            ball_window = BestAI(AIDetect(frame[crop_y1:crop_y2,crop_x1:crop_x2],0.2))
+            if ball_window is not None:
+                ball_window[0] += crop_x1
+                ball_window[2] += crop_x1
+                ball_window[1] += crop_y1
+                ball_window[3] += crop_y1
+                break
+        if ball_window is None:
+            ball_window = BestAI(AIDetect(frame,0.3))
+            if ball_window is None:
+                ball_window = []
+                ball_window.append(pred_x-prev_rad)
+                ball_window.append(pred_y-prev_rad)
+                ball_window.append(pred_x+prev_rad)
+                ball_window.append(pred_y+prev_rad)
+
+    yolo_x = int((ball_window[0] + ball_window[2]) / 2)
+    yolo_y = int((ball_window[1] + ball_window[3]) / 2)
+
+    ball_location = HoughTrans(ball_window, frame)
+
+    if ball_location is not None:
+        measurement_x = ball_location[0]
+        measurement_y = ball_location[1]
+        radius = ball_location[2]
+
+    else:
+        measurement_x = yolo_x
+        measurement_y = yolo_y
+
+        width = ball_window[2] - ball_window[0]
+        height = ball_window[3] - ball_window[1]
+        radius = int((width + height) / 4)
+
+    measurement = np.array([
+        [np.float32(measurement_x)],
+        [np.float32(measurement_y)]
+    ])
+
+    estimated = kf.correct(measurement)
+
+    ball_location = [
+        int(estimated[0, 0]),
+        int(estimated[1, 0]),
+        radius
+    ]
+
+    if prev_rad is not None and abs(prev_rad-ball_location[2])>clamp:
+            if ball_location[2]>prev_rad:
+                ball_location[2] = prev_rad+clamp
+            else:
+                ball_location[2] = prev_rad-clamp
+
+
+
+
+    cv2.circle(frame, (int(ball_location[0]), int(ball_location[1])), int(ball_location[2]), (0, 255, 0), 2)
+    drawn_frames.append(frame.copy())
+    prev_rad = ball_location[2]
+
+
+
+
+
+fps = 30
+
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+out = cv2.VideoWriter(
+    "basketball2.mp4",
+    fourcc,
+    fps,
+    (max_x, max_y)
+)
+
+for frame in drawn_frames:
+    out.write(frame)
+
+video.release()
+out.release()
